@@ -1,3 +1,9 @@
+/**
+ * @module networking
+ * @description DCF wrapper with enhanced error handling and optional metric logging for debugging.
+ * Errors are caught, logged, and relayed via IPC for GUI display. Metrics (e.g., latency, error rates) are optionally logged via Winston if config.metrics = true.
+ */
+
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');
 const fs = require('fs');
@@ -5,9 +11,10 @@ const path = require('path');
 const noble = require('@abandonware/noble');
 const mdns = require('mdns');
 const winston = require('winston');
-const { ipcMain } = require('electron');  // For relaying to renderer
+const { ipcMain } = require('electron');
 
 const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'dcf-config.json'), 'utf8'));
+const enableMetrics = config.metrics || false;  // Optional: Toggle in dcf-config.json
 
 const packageDefinition = protoLoader.loadSync(path.join(__dirname, '../messages.proto'));
 const proto = grpc.loadPackageDefinition(packageDefinition).dcf;
@@ -20,64 +27,116 @@ const logger = winston.createLogger({
 
 let server = null;
 let clients = new Map();
+let errorCount = 0;  // For metric logging
 
 function startDCFServices() {
-  server = new grpc.Server();
-  server.addService(proto.DCFService.service, {
-    SendMessage: (call, callback) => {
-      const msg = call.request;
-      logger.info(`Received: ${msg.data}`);
-      // Handle types (ai_response, etc.)
-      callback(null, { data: 'Acknowledged' });
-    },
-  });
-  server.bindAsync(`${config.host}:${config.port}`, grpc.ServerCredentials.createInsecure(), () => {
-    server.start();
-  });
+  try {
+    server = new grpc.Server();
+    server.addService(proto.DCFService.service, {
+      SendMessage: (call, callback) => {
+        try {
+          const msg = call.request;
+          logger.info(`Received: ${msg.data}`);
+          // Handle types...
+          callback(null, { data: 'Acknowledged' });
+        } catch (err) {
+          errorCount++;
+          logger.error(`SendMessage error: ${err.message}`);
+          ipcMain.emit('dcf-error', { message: err.message });  // Relay to GUI
+          callback({ code: grpc.status.INTERNAL, details: err.message });
+        }
+      },
+    });
+    server.bindAsync(`${config.host}:${config.port}`, grpc.ServerCredentials.createInsecure(), (err) => {
+      if (err) throw err;
+      server.start();
+    });
+  } catch (err) {
+    logger.error(`Service start error: ${err.message}`);
+    ipcMain.emit('dcf-error', { message: 'Failed to start DCF services' });
+  }
 }
 
 async function connectToPeer(peerAddress) {
-  if (!clients.has(peerAddress)) {
-    const client = new proto.DCFService(peerAddress, grpc.credentials.createInsecure());
-    clients.set(peerAddress, client);
+  try {
+    if (!clients.has(peerAddress)) {
+      const client = new proto.DCFService(peerAddress, grpc.credentials.createInsecure());
+      clients.set(peerAddress, client);
+    }
+    return clients.get(peerAddress);
+  } catch (err) {
+    errorCount++;
+    logger.error(`Connect error: ${err.message}`);
+    ipcMain.emit('dcf-error', { message: `Failed to connect to ${peerAddress}` });
+    throw err;  // Rethrow for caller handling
   }
-  return clients.get(peerAddress);
 }
 
 async function sendToPeers(payload, recipient = null, type = 'general') {
-  const data = JSON.stringify({ type, ...payload });
-  clients.forEach((client, address) => {
-    if (!recipient || address === recipient) {
-      client.SendMessage({ data }, (err, response) => {
-        if (err) logger.error(err);
-      });
+  const start = Date.now();
+  try {
+    const data = JSON.stringify({ type, ...payload });
+    clients.forEach(async (client, address) => {
+      if (!recipient || address === recipient) {
+        await new Promise((resolve, reject) => {
+          client.SendMessage({ data }, (err, response) => {
+            if (err) reject(err);
+            resolve(response);
+          });
+        });
+      }
+    });
+    if (enableMetrics) {
+      const latency = Date.now() - start;
+      logger.info(`Send latency: ${latency}ms, errors: ${errorCount}`);
     }
-  });
+  } catch (err) {
+    errorCount++;
+    logger.error(`Send error: ${err.message}`);
+    ipcMain.emit('dcf-error', { message: err.message });
+    throw err;
+  }
 }
 
 function discoverPeers() {
-  const browser = mdns.createBrowser(mdns.tcp('dcf-service'));
-  browser.on('serviceUp', service => {
-    const address = `${service.addresses[0]}:${service.port}`;
-    connectToPeer(address);
-    ipcMain.emit('peer-discovered', address);  // Relay to renderer for GUI update
-  });
-  browser.start();
-  const ad = mdns.createAdvertisement(mdns.tcp('dcf-service'), config.port);
-  ad.start();
+  try {
+    const browser = mdns.createBrowser(mdns.tcp('dcf-service'));
+    browser.on('serviceUp', service => {
+      const address = `${service.addresses[0]}:${service.port}`;
+      connectToPeer(address).catch(() => {});  // Handle error internally
+      ipcMain.emit('peer-discovered', address);
+    });
+    browser.start();
+    const ad = mdns.createAdvertisement(mdns.tcp('dcf-service'), config.port);
+    ad.start();
+  } catch (err) {
+    errorCount++;
+    logger.error(`Discovery error: ${err.message}`);
+    ipcMain.emit('dcf-error', { message: 'Discovery failed' });
+  }
 }
 
 class CustomBLETransport {
   setup() {
     noble.on('stateChange', state => {
-      if (state === 'poweredOn') noble.startScanning();
+      if (state === 'poweredOn') {
+        noble.startScanning();
+      } else {
+        logger.warn(`BLE state: ${state}`);
+      }
     });
     noble.on('discover', peripheral => {
-      ipcMain.emit('peer-discovered', peripheral.uuid);  // Relay to GUI
+      ipcMain.emit('peer-discovered', peripheral.uuid);
     });
   }
   send(data) {
-    // BLE write logic
+    try {
+      // BLE write...
+    } catch (err) {
+      errorCount++;
+      logger.error(`BLE send error: ${err.message}`);
+      ipcMain.emit('dcf-error', { message: 'BLE send failed' });
+    }
   }
 }
 
