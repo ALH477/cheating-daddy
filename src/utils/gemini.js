@@ -1,6 +1,6 @@
 const { GoogleGenAI, Modality } = require('@google/genai');
 const { BrowserWindow, ipcMain } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const { saveDebugAudio } = require('../audioUtils');
 const { getSystemPrompt } = require('./prompts');
 const { getAvailableModel, incrementLimitCount, getApiKey } = require('../storage');
@@ -380,77 +380,119 @@ async function attemptReconnect() {
     return false;
 }
 
+// ==========================================
+// SYSTEM AUDIO CAPTURE (Linux & macOS)
+// ==========================================
+
+function checkSystemDependencies() {
+    if (process.platform === 'darwin') return true;
+    if (process.platform === 'linux') {
+        try {
+            // Check for 'parec' (works on both PulseAudio and PipeWire)
+            execSync('which parec', { stdio: 'ignore' });
+            return true;
+        } catch (e) {
+            console.error('CRITICAL ERROR: "parec" not found. PulseAudio/PipeWire tools missing.');
+            return false;
+        }
+    }
+    return false;
+}
+
 function killExistingSystemAudioDump() {
     return new Promise(resolve => {
-        console.log('Checking for existing SystemAudioDump processes...');
+        // Linux: Target our specific alias 'cheating_daddy_dump'
+        // macOS: Target the binary name 'SystemAudioDump'
+        const processName = process.platform === 'linux' ? 'cheating_daddy_dump' : 'SystemAudioDump';
+        console.log(`Checking for existing ${processName} processes...`);
 
-        // Kill any existing SystemAudioDump processes
-        const killProc = spawn('pkill', ['-f', 'SystemAudioDump'], {
-            stdio: 'ignore',
-        });
+        // Quietly attempt to kill existing instances
+        const killProc = spawn('pkill', ['-f', processName], { stdio: 'ignore' });
 
         killProc.on('close', code => {
-            if (code === 0) {
-                console.log('Killed existing SystemAudioDump processes');
-            } else {
-                console.log('No existing SystemAudioDump processes found');
-            }
+            if (code === 0) console.log(`Killed existing ${processName}`);
             resolve();
         });
 
         killProc.on('error', err => {
-            console.log('Error checking for existing processes (this is normal):', err.message);
+            console.log('Error checking for existing processes:', err.message);
             resolve();
         });
 
-        // Timeout after 2 seconds
+        // Hard timeout to prevent hanging during startup
         setTimeout(() => {
-            killProc.kill();
+            if (!killProc.killed) killProc.kill();
             resolve();
-        }, 2000);
+        }, 1000);
     });
 }
 
-async function startMacOSAudioCapture(geminiSessionRef) {
-    if (process.platform !== 'darwin') return false;
-
-    // Kill any existing SystemAudioDump processes first
-    await killExistingSystemAudioDump();
-
-    console.log('Starting macOS audio capture with SystemAudioDump...');
-
-    const { app } = require('electron');
-    const path = require('path');
-
-    let systemAudioPath;
-    if (app.isPackaged) {
-        systemAudioPath = path.join(process.resourcesPath, 'SystemAudioDump');
-    } else {
-        systemAudioPath = path.join(__dirname, '../assets', 'SystemAudioDump');
-    }
-
-    console.log('SystemAudioDump path:', systemAudioPath);
-
-    const spawnOptions = {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-            ...process.env,
-        },
-    };
-
-    systemAudioProc = spawn(systemAudioPath, [], spawnOptions);
-
-    if (!systemAudioProc.pid) {
-        console.error('Failed to start SystemAudioDump');
+async function startSystemAudioCapture(geminiSessionRef) {
+    // 1. Platform Gate
+    if (process.platform !== 'darwin' && process.platform !== 'linux') {
+        console.warn(`Audio capture not supported on ${process.platform}`);
         return false;
     }
 
-    console.log('SystemAudioDump started with PID:', systemAudioProc.pid);
+    // 2. Dependency Sanity Check
+    if (!checkSystemDependencies()) {
+        sendToRenderer('update-status', 'Error: System audio tools missing. Install pulseaudio-utils.');
+        return false;
+    }
 
-    const CHUNK_DURATION = 0.1;
-    const SAMPLE_RATE = 24000;
-    const BYTES_PER_SAMPLE = 2;
-    const CHANNELS = 2;
+    await killExistingSystemAudioDump();
+    console.log(`Starting system audio capture for ${process.platform}...`);
+
+    let spawnCmd, spawnArgs;
+    // Gemini Native Audio expects 16kHz or 24kHz. 
+    // We use 24kHz to match original macOS implementation.
+    const SAMPLE_RATE = 24000; 
+
+    if (process.platform === 'darwin') {
+        // --- macOS Legacy Logic ---
+        const { app } = require('electron');
+        const path = require('path');
+        const binaryPath = app.isPackaged 
+            ? path.join(process.resourcesPath, 'SystemAudioDump')
+            : path.join(__dirname, '../assets', 'SystemAudioDump');
+        
+        console.log('SystemAudioDump path:', binaryPath);
+        spawnCmd = binaryPath;
+        spawnArgs = [];
+    } 
+    else if (process.platform === 'linux') {
+        // --- Linux Logic (PipeWire/PulseAudio) ---
+        // TRICK: We wrap the command in bash to assign a custom process name (argv[0]).
+        // This ensures 'pkill -f cheating_daddy_dump' ONLY kills this specific process.
+        spawnCmd = 'bash';
+        spawnArgs = [
+            '-c',
+            `exec -a cheating_daddy_dump parec --format=s16le --rate=${SAMPLE_RATE} --channels=1 --latency-msec=20 -d @DEFAULT_MONITOR@`
+        ];
+    }
+
+    try {
+        systemAudioProc = spawn(spawnCmd, spawnArgs, {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env: { ...process.env }
+        });
+    } catch (err) {
+        console.error('FATAL: Failed to spawn audio process:', err);
+        return false;
+    }
+
+    if (!systemAudioProc.pid) {
+        console.error('Audio process spawned but has no PID');
+        return false;
+    }
+
+    console.log(`Audio capture started with PID: ${systemAudioProc.pid}`);
+
+    // 3. Audio Stream Processing
+    const BYTES_PER_SAMPLE = 2; // 16-bit
+    // Linux is optimized to record Mono (1ch) directly, saving CPU. macOS is Stereo (2ch).
+    const CHANNELS = process.platform === 'linux' ? 1 : 2; 
+    const CHUNK_DURATION = 0.1; // 100ms
     const CHUNK_SIZE = SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS * CHUNK_DURATION;
 
     let audioBuffer = Buffer.alloc(0);
@@ -462,33 +504,41 @@ async function startMacOSAudioCapture(geminiSessionRef) {
             const chunk = audioBuffer.slice(0, CHUNK_SIZE);
             audioBuffer = audioBuffer.slice(CHUNK_SIZE);
 
+            // Optimization: Skip stereo-to-mono conversion on Linux (already mono)
             const monoChunk = CHANNELS === 2 ? convertStereoToMono(chunk) : chunk;
+            
             const base64Data = monoChunk.toString('base64');
             sendAudioToGemini(base64Data, geminiSessionRef);
 
             if (process.env.DEBUG_AUDIO) {
-                console.log(`Processed audio chunk: ${chunk.length} bytes`);
                 saveDebugAudio(monoChunk, 'system_audio');
             }
         }
-
-        const maxBufferSize = SAMPLE_RATE * BYTES_PER_SAMPLE * 1;
-        if (audioBuffer.length > maxBufferSize) {
-            audioBuffer = audioBuffer.slice(-maxBufferSize);
+        
+        // MEMORY LEAK PROTECTION:
+        // If the Gemini API stalls, the buffer will grow indefinitely. 
+        // We purge it if it exceeds ~5 seconds of audio.
+        if (audioBuffer.length > CHUNK_SIZE * 50) {
+            console.warn('[Audio] Buffer overflow protection triggered. Purging old audio.');
+            audioBuffer = Buffer.alloc(0);
         }
     });
 
     systemAudioProc.stderr.on('data', data => {
-        console.error('SystemAudioDump stderr:', data.toString());
+        // Filter out verbose PulseAudio info, log only real errors
+        const msg = data.toString();
+        if (msg.includes('Err') || msg.includes('fail') || msg.includes('denied')) {
+            console.error('[Audio Capture Error]:', msg.trim());
+        }
     });
 
     systemAudioProc.on('close', code => {
-        console.log('SystemAudioDump process closed with code:', code);
+        console.log(`Audio capture process exited (code ${code})`);
         systemAudioProc = null;
     });
 
     systemAudioProc.on('error', err => {
-        console.error('SystemAudioDump process error:', err);
+        console.error('Audio capture process error:', err);
         systemAudioProc = null;
     });
 
@@ -507,9 +557,9 @@ function convertStereoToMono(stereoBuffer) {
     return monoBuffer;
 }
 
-function stopMacOSAudioCapture() {
+function stopSystemAudioCapture() {
     if (systemAudioProc) {
-        console.log('Stopping SystemAudioDump...');
+        console.log('Stopping system audio capture...');
         systemAudioProc.kill('SIGTERM');
         systemAudioProc = null;
     }
@@ -671,36 +721,30 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
         }
     });
 
+    // NOTE: Maintaining 'start-macos-audio' channel name for frontend backward compatibility
     ipcMain.handle('start-macos-audio', async event => {
-        if (process.platform !== 'darwin') {
-            return {
-                success: false,
-                error: 'macOS audio capture only available on macOS',
-            };
-        }
-
         try {
-            const success = await startMacOSAudioCapture(geminiSessionRef);
+            const success = await startSystemAudioCapture(geminiSessionRef);
             return { success };
         } catch (error) {
-            console.error('Error starting macOS audio capture:', error);
+            console.error('Error starting system audio capture:', error);
             return { success: false, error: error.message };
         }
     });
 
     ipcMain.handle('stop-macos-audio', async event => {
         try {
-            stopMacOSAudioCapture();
+            stopSystemAudioCapture();
             return { success: true };
         } catch (error) {
-            console.error('Error stopping macOS audio capture:', error);
+            console.error('Error stopping system audio capture:', error);
             return { success: false, error: error.message };
         }
     });
 
     ipcMain.handle('close-session', async event => {
         try {
-            stopMacOSAudioCapture();
+            stopSystemAudioCapture();
 
             // Set flag to prevent reconnection attempts
             isUserClosing = true;
@@ -761,9 +805,11 @@ module.exports = {
     saveConversationTurn,
     getCurrentSessionData,
     killExistingSystemAudioDump,
-    startMacOSAudioCapture,
+    startMacOSAudioCapture: startSystemAudioCapture, // Alias for backward compat export
+    startSystemAudioCapture,
     convertStereoToMono,
-    stopMacOSAudioCapture,
+    stopMacOSAudioCapture: stopSystemAudioCapture, // Alias for backward compat export
+    stopSystemAudioCapture,
     sendAudioToGemini,
     sendImageToGeminiHttp,
     setupGeminiIpcHandlers,
